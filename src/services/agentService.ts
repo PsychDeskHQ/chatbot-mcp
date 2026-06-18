@@ -9,6 +9,7 @@ import {
 import type { Scope } from "../types/scope.js";
 import { TOOL_DECLARATIONS, dispatch } from "../tools/index.js";
 import { getLogger } from "../utils/logger.js";
+import { generateContentWithRetry, type GeminiRetryOptions } from "../utils/geminiRetry.js";
 
 export const SYSTEM_PROMPT = `You are an assistant embedded in a therapy practice-management platform. You are helping a therapist work with ONE specific client whose record is already loaded into scope for this conversation.
 
@@ -58,6 +59,7 @@ export interface RunChatParams {
   userMessage: string;
   scope: Scope;
   maxToolRounds: number;
+  geminiRetry?: GeminiRetryOptions;
 }
 
 export interface RunChatResult {
@@ -70,7 +72,7 @@ export interface RunChatResult {
  * Returns (reply_text, updated_history). `history` is not mutated.
  */
 export async function runChat(params: RunChatParams): Promise<RunChatResult> {
-  const { client, model, history, userMessage, scope, maxToolRounds } = params;
+  const { client, model, history, userMessage, scope, maxToolRounds, geminiRetry } = params;
   const logger = getLogger();
   const config = buildConfig();
   const contents: Content[] = [
@@ -78,14 +80,17 @@ export async function runChat(params: RunChatParams): Promise<RunChatResult> {
     { role: "user", parts: [{ text: userMessage }] },
   ];
 
+  const retryOptions: GeminiRetryOptions = geminiRetry ?? { models: [model] };
+  let activeModel = model;
   let reply = "";
 
   for (let round = 0; round <= maxToolRounds; round++) {
-    const response = await client.models.generateContent({
-      model,
-      contents,
-      config,
-    });
+    const { response, modelUsed } = await generateContentWithRetry(
+      client,
+      { model: activeModel, contents, config },
+      retryOptions
+    );
+    activeModel = modelUsed;
 
     const candidate = response.candidates?.[0];
     if (!candidate?.content) {

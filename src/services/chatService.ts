@@ -1,6 +1,7 @@
 import type { GoogleGenAI } from "@google/genai";
 
 import type { Settings } from "../config/index.js";
+import { getGeminiModelChain } from "../config/index.js";
 import type { ChatRequest, ChatResponse } from "../types/api.js";
 import type { Scope } from "../types/scope.js";
 import { runChat } from "./agentService.js";
@@ -49,6 +50,11 @@ export class ChatService {
       userMessage: req.message,
       scope,
       maxToolRounds: this.settings.MAX_TOOL_ROUNDS,
+      geminiRetry: {
+        models: getGeminiModelChain(this.settings),
+        maxRetriesPerModel: this.settings.GEMINI_MAX_RETRIES,
+        requestTimeoutMs: this.settings.GEMINI_REQUEST_TIMEOUT_MS,
+      },
     });
 
     store.updateHistory(conversationId, updatedHistory);
