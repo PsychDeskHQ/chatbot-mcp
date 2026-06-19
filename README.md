@@ -5,9 +5,9 @@ platform. A therapist (or an internal service acting for one) chats about **one
 specific client**: the assistant can look up the client's profile, read their
 therapy notes and assigned worksheets, and **update an existing note**.
 
-It is powered by the **Gemini API** (`google-genai` SDK) with a manual
-tool-use loop, and talks **directly to Postgres**. This is an MVP intended for
-internal use — see [Limitations & next steps](#limitations--next-steps).
+Built with **Node.js 22+**, **TypeScript**, **Express**, and the **Gemini API**
+with a manual tool-use loop. Talks **directly to Postgres**. This is an MVP
+intended for internal use — see [Limitations & next steps](#limitations--next-steps).
 
 ---
 
@@ -30,9 +30,9 @@ internal use — see [Limitations & next steps](#limitations--next-steps).
 ## Architecture
 
 ```
-POST /chat                    app/agent.py                app/tools.py        app/db.py
-  │  organization_id           Gemini tool-use loop  ─────► scoped dispatch ──► parameterized
-  │  therapist_id        ────► (google-genai, async)        (injects scope)     SQL on Postgres
+POST /chat                    agentService.ts             tools/dispatch.ts   db/queries.ts
+  │  organization_id           Gemini tool-use loop  ──► scoped dispatch ──► parameterized
+  │  therapist_id        ────► (@google/genai)            (injects scope)     SQL on Postgres
   │  client_id                 + topic-guardrail system
   │  message                   prompt
   └─ conversation_id?
@@ -42,17 +42,24 @@ The model only ever sees tool schemas **without** `organization_id`/`client_id`.
 Those are injected from the request `Scope`, so the model physically cannot
 reach another client or org.
 
-### Files
+### File layout
 
-| File | Responsibility |
+| Path | Responsibility |
 |------|----------------|
-| `app/config.py` | Loads + validates settings from env (`.env` supported). |
-| `app/db.py` | asyncpg pool and **all** SQL. Every query is scoped + parameterized. |
-| `app/tools.py` | Gemini function declarations + `dispatch()` that injects scope and runs the right DB call. |
-| `app/agent.py` | System prompt (topic guardrail) + the async tool-use loop. |
-| `app/models.py` | Pydantic request/response models for `/chat`. |
-| `app/main.py` | FastAPI app, lifespan (DB pool + Gemini client), in-memory conversation store. |
-| `main.py` | `python main.py` launcher (uvicorn). |
+| `src/index.ts` | Server bootstrap, DB pool lifecycle |
+| `src/app.ts` | Express app, middleware, DI wiring |
+| `src/config/` | Env validation (Zod) |
+| `src/types/` | Zod schemas + shared types |
+| `src/db/` | `pg` pool + scoped SQL queries |
+| `src/tools/` | Gemini tool declarations + dispatch |
+| `src/services/agentService.ts` | System prompt + tool-use loop |
+| `src/services/conversationService.ts` | In-memory conversation store |
+| `src/services/chatService.ts` | `/chat` business logic |
+| `src/controllers/` | HTTP handlers |
+| `src/routes/` | Route definitions |
+| `src/middleware/` | Validation, errors, rate limit, logging |
+| `sql/schema.sql` | Postgres schema |
+| `sql/seed.sql` | Sample data for local testing |
 
 ---
 
@@ -88,23 +95,38 @@ The assistant reads these tables and updates only `client_notes`:
 
 ## Setup
 
-Requires Python 3.13+ and a Postgres database. Uses [uv](https://docs.astral.sh/uv/)
-(or plain `pip`).
+Requires **Node.js 22+**, Postgres, and a Gemini API key.
 
 ```bash
-# 1. Install deps
-uv sync                # or: pip install -e .
-
-# 2. Configure
-cp .env.example .env
-# edit .env: set GEMINI_API_KEY and DATABASE_URL
-
-# 3. Run
-python main.py         # serves http://127.0.0.1:8000
-#   set RELOAD=1 in .env for auto-reload during development
+nvm use                 # optional, see .nvmrc
+npm install
+cp .env.example .env    # set GEMINI_API_KEY and DATABASE_URL
+psql "$DATABASE_URL" -f sql/schema.sql
+psql "$DATABASE_URL" -f sql/seed.sql   # optional sample data
+npm run dev             # http://127.0.0.1:8000
 ```
 
+| Command | Purpose |
+|---------|---------|
+| `npm run dev` | Development with hot reload |
+| `npm run build` | Compile to `dist/` |
+| `npm start` | Run production build |
+| `npm run typecheck` | Type-check only |
+
 Get a Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey).
+
+### Stack
+
+| Layer | Technology |
+|-------|------------|
+| Runtime | Node.js 22+, TypeScript |
+| HTTP | Express.js |
+| Validation | Zod |
+| Database | PostgreSQL + `pg` pool |
+| AI | `@google/genai` (Gemini) |
+| Config | dotenv + Zod |
+| Logging | Winston |
+| Security | Helmet, CORS, rate limiting |
 
 ### Configuration (env vars)
 
@@ -115,7 +137,11 @@ Get a Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey)
 | `GEMINI_MODEL` | — | `gemini-3.5-flash` | Any current Gemini model id. |
 | `MAX_TOOL_ROUNDS` | — | `8` | Loop guard: max tool rounds per message. |
 | `HOST` / `PORT` | — | `127.0.0.1` / `8000` | Server bind. |
-| `RELOAD` | — | off | Non-empty = uvicorn auto-reload. |
+| `NODE_ENV` | — | `development` | Environment. |
+| `CORS_ORIGIN` | — | `*` | Comma-separated origins. |
+| `RATE_LIMIT_WINDOW_MS` | — | `60000` | Rate limit window. |
+| `RATE_LIMIT_MAX` | — | `60` | Max requests per window on `/chat`. |
+| `LOG_LEVEL` | — | `info` | Winston log level. |
 
 ---
 
@@ -169,7 +195,7 @@ curl -s http://127.0.0.1:8000/chat \
 
 1. `/chat` builds a `Scope(organization_id, therapist_id, client_id)` from the
    request body.
-2. `run_chat` sends the message + history to Gemini with the tool schemas and
+2. `runChat` sends the message + history to Gemini with the tool schemas and
    the guardrail system prompt.
 3. If Gemini requests tools, `dispatch()` runs each one **with the scope
    injected**, returns JSON-safe results, and feeds them back (echoing each
@@ -186,15 +212,15 @@ This is an MVP. Known gaps, roughly in priority order:
 - **Auth.** `/chat` trusts the caller to send `organization_id` / `therapist_id`
   / `client_id` honestly. Before exposing it beyond a trusted internal caller,
   derive these from an authenticated token instead of the request body.
-- **Conversation storage is in-memory.** State lives in a process-local dict —
+- **Conversation storage is in-memory.** State lives in a process-local store —
   not durable, lost on restart, not shared across workers. Move to Redis/Postgres
   for anything real.
-- **No streaming.** Replies are returned whole. `client.aio.models.generate_content_stream`
-  is a straightforward upgrade.
+- **No streaming.** Replies are returned whole. Streaming `generateContent` is
+  a straightforward upgrade.
 - **Topic guardrail is prompt-based.** Good enough internally; add an explicit
   classifier/validation step if stronger enforcement is needed.
 - **Notes are update-only by design.** Create/delete were intentionally left out
   for the MVP; add tools + DB functions when needed.
-- **No tests yet** and **no rate limiting / observability**. Add before scaling.
+- **No tests yet.** Add integration tests before scaling.
 - **PHI:** request/response bodies are not logged by the app. Keep it that way,
   and review retention/compliance before production.
